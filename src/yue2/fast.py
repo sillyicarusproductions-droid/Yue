@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue as _queue
 import selectors
 import signal
 import subprocess
@@ -27,7 +28,8 @@ from .protocol import ABC_END, CODEC_OFFSET, CODEC_SIZE, CONTEXT, EOD, MUSIC_END
 from .storage import identity, model_identity, sha256_file, write_json
 
 WIRE = "YUE2_FAST\t"
-PENALTY, WINDOW = "yue2_window_penalty", "yue2_penalty_window"
+PENALTY, WINDOW, PHASE = "yue2_window_penalty", "yue2_penalty_window", "yue2_phase"
+_worker_lock = threading.Lock()
 
 
 def ar_keys(config):
@@ -111,8 +113,34 @@ def derive_ar_checkpoint(model_dir, cache_dir=None):
     return target
 
 
+def _v2_sampler_available():
+    try:
+        import vllm.v1.worker.gpu.sample.logits_processor  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _sampling_extra_args(sampling, phase, v2):
+    extra = {PENALTY: sampling.repetition_penalty, WINDOW: sampling.penalty_window}
+    if v2:
+        extra[PHASE] = phase
+    return extra
+
+
+def _allowed_token_ids(phase, v2):
+    """Vocabulary restriction per stage: phase masks on the V2 model-runner
+    sampler, allowed_token_ids on the V1 sampler (which has no 1024-id cap)."""
+    if v2:
+        return None
+    if phase == "abc":
+        return list(range(EOD)) + [ABC_END]
+    return list(range(CODEC_OFFSET, CODEC_OFFSET + CODEC_SIZE)) + [MUSIC_END]
+
+
 def kv_cache_bytes(config, max_sequences=1, context=CONTEXT, block_size=16):
-    positions = math.ceil(context / block_size) * block_size
+    # vLLM's admission check adds per-request pages beyond the raw context.
+    positions = math.ceil((context + 256) / block_size) * block_size
     return positions * max_sequences * config["num_hidden_layers"] * 2 * config["num_key_value_heads"] * config["head_dim"] * 2
 
 
@@ -120,6 +148,68 @@ def __getattr__(name):
     if name != "WindowedPenalty":
         raise AttributeError(name)
     # vLLM resolves this FQCN only inside its optional worker processes.
+    try:
+        from vllm.v1.worker.gpu.sample.logits_processor import LogitsProcessor
+    except ImportError:
+        LogitsProcessor = None
+    if LogitsProcessor is not None:
+        # Model-runner V2 interface: committed tokens live on device, so the
+        # windowed penalty reads req_states directly instead of mirroring.
+        import torch
+
+        class WindowedPenalty(LogitsProcessor):
+            def __init__(self, vllm_config, req_states):
+                self.state = req_states
+                self.slots = {}
+                # vLLM caps allowed_token_ids at 1024, and each stage's allowed
+                # set is a contiguous range plus its end token anyway: express
+                # it as a precomputed additive mask applied before the penalty.
+                vocab = req_states.vocab_size
+                device = req_states.device
+                abc_mask = torch.zeros(vocab, dtype=torch.float32, device=device)
+                abc_mask[EOD:] = float("-inf")
+                abc_mask[ABC_END] = 0.
+                semantic_mask = torch.zeros(vocab, dtype=torch.float32, device=device)
+                semantic_mask[:CODEC_OFFSET] = float("-inf")
+                semantic_mask[CODEC_OFFSET + CODEC_SIZE:] = float("-inf")
+                semantic_mask[MUSIC_END] = 0.
+                self.phase_masks = {"abc": abc_mask, "semantic": semantic_mask}
+
+            @classmethod
+            def validate_params(cls, params):
+                extra = params.extra_args or {}
+                if not 0 < float(extra.get(PENALTY, 1)) or not 1 <= int(extra.get(WINDOW, 50)) <= 100:
+                    raise ValueError("Invalid window penalty")
+
+            def add_request(self, req_idx, sampling_params):
+                extra = sampling_params.extra_args or {}
+                penalty = float(extra.get(PENALTY, 1.))
+                self.slots[req_idx] = (penalty, int(extra.get(WINDOW, 50)), extra.get(PHASE))
+                return penalty != 1. or extra.get(PHASE) is not None
+
+            def apply(self, logits, ctx):
+                for row, slot in enumerate(ctx.idx_mapping_np.tolist()):
+                    penalty, window, phase = self.slots.get(slot, (1., 50, None))
+                    if phase is not None:
+                        logits[row] += self.phase_masks[phase]
+                    if penalty == 1.:
+                        continue
+                    state = self.state
+                    total = int(state.total_len.gpu[slot])
+                    prompt = int(state.prefill_len.cpu[slot])
+                    if total <= prompt:
+                        continue  # prefill steps have no committed output yet
+                    recent = state.all_token_ids.gpu[slot, max(prompt, total - window):total]
+                    ids, counts = recent.unique(return_counts=True)
+                    multiplier = penalty ** counts.to(torch.float32)
+                    values = logits[row, ids.long()]
+                    logits[row, ids.long()] = torch.where(values < 0, values * multiplier, values / multiplier)
+                return logits
+
+        WindowedPenalty.__module__ = __name__
+        WindowedPenalty.__qualname__ = "WindowedPenalty"
+        globals()[name] = WindowedPenalty
+        return WindowedPenalty
     from vllm.v1.sample.logits_processor import LogitsProcessor
     import torch
     import triton
@@ -186,7 +276,7 @@ def __getattr__(name):
                 self.alphas[index].copy_(self.lookup[penalty])
 
         def apply(self, logits):
-            if logits.device.type == "cuda":
+            if logits.device.type in {"cuda", "xpu"}:
                 n = len(logits)
                 self.host[:n].fill_(-1)
                 host = self.host.numpy()
@@ -228,13 +318,23 @@ def _stop_process(process):
 
 class _Worker:
     def __init__(self, pipe):
-        self.lock = threading.Lock()
+        self.requests = {}
         self.temp = tempfile.TemporaryDirectory(prefix="yue2-vllm-")
         self.log_path = Path(self.temp.name) / "worker.log"
         self.log = self.log_path.open("w+")
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        self.process = subprocess.Popen([sys.executable, "-m", "yue2.fast", "--worker"],
+        python = os.environ.get("YUE2_VLLM_PYTHON") or sys.executable
+        import torch
+        if torch.device(pipe.device).type == "xpu":
+            # oneCCL's libfabric and the torch XPU runtime live in the worker
+            # environment's lib dir; torch finds them by RPATH only once CCL's
+            # own loader has been pointed there.
+            lib = str(Path(python).absolute().parent.parent / "lib")
+            env["LD_LIBRARY_PATH"] = lib + ((":" + env["LD_LIBRARY_PATH"]) if env.get("LD_LIBRARY_PATH") else "")
+            env.setdefault("FI_PROVIDER_PATH", lib)
+            env.setdefault("FI_PROVIDER", "shm")
+        self.process = subprocess.Popen([python, "-m", "yue2.fast", "--worker"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                          bufsize=0, env=env, start_new_session=True)
         self.finalizer = weakref.finalize(self, _stop_process, self.process)
@@ -243,47 +343,82 @@ class _Worker:
         self.buffer = b""
         self._send({"model_dir": str(pipe.model_dir), "device": str(pipe.device),
                     "memory_budget_gib": pipe.memory_budget_gib})
+        self.dispatcher = threading.Thread(target=self._dispatch, daemon=True)
+        self.dispatcher.start()
 
     def _send(self, value):
         self.process.stdin.write((json.dumps(value) + "\n").encode())
         self.process.stdin.flush()
 
-    def request(self, payload, cancelled=None, on_token=None):
-        with self.lock:
-            self._send(payload)
+    def _dispatch(self):
+        """Route worker events to per-request queues; id-less events are fatal."""
+        try:
             while True:
-                if cancelled is not None and cancelled():
-                    self.close()
-                    raise InterruptedError("Cancelled during vLLM AR generation")
-                if self.selector.select(timeout=.1):
+                if self.selector.select(timeout=.5):
                     block = os.read(self.process.stdout.fileno(), 65536)
                     if not block:
                         break
                     self.buffer += block
                     while b"\n" in self.buffer:
                         raw, self.buffer = self.buffer.split(b"\n", 1)
-                        line = raw.decode(errors="replace")
-                        if not line.startswith(WIRE):
-                            self.log.write(line + "\n")
-                            continue
-                        event = json.loads(line[len(WIRE):])
-                        if event.get("error"):
-                            self.close()
-                            raise RuntimeError(event["error"])
-                        if event.get("event") == "token" and on_token is not None:
-                            on_token(payload["phase"], event["token"])
-                        if event.get("event") == "result":
-                            return event["ids"], event["timing"], event["truncated"]
-                if self.process.poll() is not None and not self.selector.select(timeout=0):
-                    break
-            self.log.flush()
-            details = self.log_path.read_text(encoding="utf-8", errors="replace")[-12000:]
-            self.close()
-            raise RuntimeError(f"vLLM worker exited without a result: {details}")
+                        self._dispatch_line(raw.decode(errors="replace"))
+        finally:
+            self._fail_pending("vLLM worker exited without a result")
+
+    def _dispatch_line(self, line):
+        if not line.startswith(WIRE):
+            self.log.write(line + "\n")
+            return
+        event = json.loads(line[len(WIRE):])
+        entry = self.requests.get(event.get("id")) if event.get("id") else None
+        if entry is None:
+            if event.get("error"):
+                self.log.write(line + "\n")
+                self._fail_pending(event["error"])
+            return
+        entry["queue"].put(event)
+
+    def _fail_pending(self, error):
+        for entry in self.requests.values():
+            entry["queue"].put({"error": error})
+
+    def request(self, payload, cancelled=None, on_token=None):
+        rid = uuid.uuid4().hex
+        entry = {"queue": _queue.Queue()}
+        self.requests[rid] = entry
+        try:
+            self._send({**payload, "id": rid})
+            while True:
+                if cancelled is not None and cancelled():
+                    self.close()
+                    raise InterruptedError("Cancelled during vLLM AR generation")
+                try:
+                    event = entry["queue"].get(timeout=.1)
+                except _queue.Empty:
+                    if self.process.poll() is not None:
+                        break
+                    continue
+                if event.get("event") == "token" and on_token is not None:
+                    on_token(payload["phase"], event["token"])
+                if event.get("event") == "result":
+                    return event["ids"], event["timing"], event["truncated"]
+                if event.get("error"):
+                    self.log.flush()
+                    details = self.log_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+                    raise RuntimeError(f"{event['error']}\n{details}")
+        finally:
+            self.requests.pop(rid, None)
+        self.log.flush()
+        details = self.log_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+        self.close()
+        raise RuntimeError(f"vLLM worker exited without a result: {details}")
 
     def close(self):
         _stop_process(self.process)
         self.finalizer.detach()
+        # Let the dispatcher leave select() before its selector is closed;
+        # otherwise the daemon thread can touch a dead epoll handle.
+        self.dispatcher.join(timeout=2)
         self.selector.close()
         for stream in (self.process.stdin, self.process.stdout, self.log):
             if stream is not None and not stream.closed:
@@ -309,8 +444,8 @@ def generate_vllm(pipe, prefix, sampling, seed, phase, negative=None, cfg_scale=
         reason = "paired_cfg_uses_torch"
     elif legacy_off:
         reason = "historical_off_sampling_uses_torch"
-    elif pipe.device.type != "cuda":
-        reason = "vllm_requires_cuda"
+    elif pipe.device.type not in {"cuda", "xpu"}:
+        reason = "vllm_requires_cuda_or_xpu"
     elif pipe.quantization != "none":
         reason = "experimental_fp8_uses_torch"
     if reason:
@@ -323,7 +458,9 @@ def generate_vllm(pipe, prefix, sampling, seed, phase, negative=None, cfg_scale=
         return ids, timing, truncated
     if cancelled is not None and cancelled():
         raise InterruptedError("Cancelled before vLLM load")
-    if importlib.util.find_spec("vllm") is None:
+    if importlib.util.find_spec("vllm") is None and not os.environ.get("YUE2_VLLM_PYTHON"):
+        # The worker subprocess owns the vLLM import; when it runs from a
+        # dedicated interpreter, the parent environment need not have vllm.
         raise ImportError("Install the optional CUDA backend with pip install 'yue2-infer[fast]'")
     if getattr(pipe, "_vllm_worker", None) is None:
         import torch
@@ -332,7 +469,8 @@ def generate_vllm(pipe, prefix, sampling, seed, phase, negative=None, cfg_scale=
         if getattr(pipe, "_vae", None) is not None:
             pipe._vae.to("cpu")
         gc.collect()
-        torch.cuda.empty_cache()
+        (torch.xpu.empty_cache() if torch.device(pipe.device).type == "xpu"
+         else torch.cuda.empty_cache())
         pipe._vllm_worker = _Worker(pipe)
     payload = {"prefix": list(prefix), "sampling": dataclasses.asdict(sampling),
                "seed": seed, "phase": phase, "stream_tokens": on_token is not None}
@@ -352,70 +490,78 @@ async def _worker_main():
     import torch
     setup = json.loads(sys.stdin.readline())
     device = torch.device(setup["device"])
-    if device.index is not None:
+    if device.type == "cuda" and device.index is not None:
         # vLLM sees one logical device; respect the parent scheduler's mapping.
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = visible.split(",")[device.index] if visible else str(device.index)
     import vllm
-    if vllm.__version__ != "0.19.0":
-        raise RuntimeError(f"This backend requires vllm==0.19.0, found {vllm.__version__}")
+    expected = os.environ.get("YUE2_VLLM_VERSION", "0.19.0")
+    if vllm.__version__ != expected:
+        raise RuntimeError(f"This backend requires vllm=={expected}, found {vllm.__version__}")
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
     derived = derive_ar_checkpoint(setup["model_dir"])
     config = json.loads((derived / "config.json").read_text(encoding="utf-8"))
-    total = torch.cuda.get_device_properties(0).total_memory
+    props = torch.xpu if device.type == "xpu" else torch.cuda
+    total = props.get_device_properties(0).total_memory
     budget = min(setup["memory_budget_gib"] * 2**30, total)
-    kv_bytes = kv_cache_bytes(config)
+    max_seqs = int(os.environ.get("YUE2_VLLM_MAX_SEQS", "1"))
+    if not 1 <= max_seqs <= 16:
+        raise ValueError("YUE2_VLLM_MAX_SEQS must be in 1..16")
+    kv_bytes = kv_cache_bytes(config, max_sequences=max_seqs)
     weights_bytes = (derived / "model.safetensors").stat().st_size
     if kv_bytes + weights_bytes + 3 * 2**30 > budget:
         raise MemoryError("Requested vLLM memory budget cannot fit full-context BF16 AR+KV+3GiB reserve")
     load_start = time.perf_counter()
     args = AsyncEngineArgs(model=str(derived), skip_tokenizer_init=True, dtype="bfloat16",
-                           max_model_len=CONTEXT, max_num_seqs=1, max_num_batched_tokens=2048,
+                           max_model_len=CONTEXT, max_num_seqs=max_seqs, max_num_batched_tokens=2048,
                            enable_chunked_prefill=True, enable_prefix_caching=True,
                            kv_cache_memory_bytes=kv_bytes,
                            gpu_memory_utilization=min(.9, (budget - 2 * 2**30) / total),
                            logits_processors=["yue2.fast:WindowedPenalty"], disable_log_stats=True)
     engine = AsyncLLM.from_engine_args(args)
+    v2 = _v2_sampler_available()
     load_seconds = time.perf_counter() - load_start
+
+    async def handle(request):
+        sampling = Sampling(**request["sampling"])
+        abc = request["phase"] == "abc"
+        end = ABC_END if abc else MUSIC_END
+        params = SamplingParams(temperature=sampling.temperature, top_p=sampling.top_p,
+                   top_k=sampling.top_k, repetition_penalty=1., min_tokens=sampling.min_tokens,
+                   max_tokens=sampling.max_tokens, seed=request["seed"], stop_token_ids=[end],
+                   allowed_token_ids=_allowed_token_ids(request["phase"], v2), detokenize=False,
+                   extra_args=_sampling_extra_args(sampling, request["phase"], v2))
+        start, first, output, sent = time.perf_counter(), None, None, 0
+        rid = request["id"]
+        async for result in engine.generate({"prompt_token_ids": request["prefix"]}, params, rid):
+            output = result.outputs[0]
+            if output.token_ids and first is None:
+                first = time.perf_counter() - start
+            if request["stream_tokens"]:
+                for token in output.token_ids[sent:]:
+                    _emit({"id": rid, "event": "token", "token": int(token)})
+                sent = len(output.token_ids)
+        if output is None:
+            raise RuntimeError("vLLM returned no output")
+        ids = list(output.token_ids)
+        ended = bool(ids and ids[-1] == end) or output.stop_reason == end
+        if ids and ids[-1] == end:
+            ids.pop()
+        elapsed = time.perf_counter() - start
+        count = len(ids) + int(ended)
+        _emit({"id": rid, "event": "result", "ids": ids, "truncated": not ended,
+               "timing": {"seconds": elapsed, "ttft_seconds": first,
+                   "output_tokens": count, "content_tokens": len(ids), "output_tps": count / elapsed,
+                   "prefix_tokens": len(request["prefix"]), "cfg_branches": 1,
+                   "backend_actual": "vllm", "backend_requested": "vllm",
+                   "engine_load_seconds": load_seconds, "kv_cache_memory_bytes": kv_bytes,
+                   "ar_derivation_identity": derived.name, "max_num_seqs": max_seqs}})
     try:
         while line := await asyncio.to_thread(sys.stdin.readline):
             request = json.loads(line)
-            sampling = Sampling(**request["sampling"])
-            abc = request["phase"] == "abc"
-            end = ABC_END if abc else MUSIC_END
-            allowed = list(range(EOD)) + [end] if abc else list(range(CODEC_OFFSET, CODEC_OFFSET + CODEC_SIZE)) + [end]
-            params = SamplingParams(temperature=sampling.temperature, top_p=sampling.top_p,
-                       top_k=sampling.top_k, repetition_penalty=1., min_tokens=sampling.min_tokens,
-                       max_tokens=sampling.max_tokens, seed=request["seed"], stop_token_ids=[end],
-                       allowed_token_ids=allowed, detokenize=False,
-                       extra_args={PENALTY: sampling.repetition_penalty, WINDOW: sampling.penalty_window})
-            start, first, output, sent = time.perf_counter(), None, None, 0
-            async for result in engine.generate({"prompt_token_ids": request["prefix"]}, params, str(uuid.uuid4())):
-                output = result.outputs[0]
-                if output.token_ids and first is None:
-                    first = time.perf_counter() - start
-                if request["stream_tokens"]:
-                    for token in output.token_ids[sent:]:
-                        _emit({"event": "token", "token": int(token)})
-                    sent = len(output.token_ids)
-            if output is None:
-                raise RuntimeError("vLLM returned no output")
-            ids = list(output.token_ids)
-            ended = bool(ids and ids[-1] == end) or output.stop_reason == end
-            if ids and ids[-1] == end:
-                ids.pop()
-            elapsed = time.perf_counter() - start
-            count = len(ids) + int(ended)
-            _emit({"event": "result", "ids": ids, "truncated": not ended,
-                   "timing": {"seconds": elapsed, "ttft_seconds": first,
-                       "output_tokens": count, "content_tokens": len(ids), "output_tps": count / elapsed,
-                       "prefix_tokens": len(request["prefix"]), "cfg_branches": 1,
-                       "backend_actual": "vllm", "backend_requested": "vllm",
-                       "engine_load_seconds": load_seconds, "kv_cache_memory_bytes": kv_bytes,
-                       "ar_derivation_identity": derived.name, "max_num_seqs": 1}})
-            load_seconds = 0.
+            asyncio.create_task(handle(request))
     finally:
         engine.shutdown()
 
